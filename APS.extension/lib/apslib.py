@@ -164,27 +164,42 @@ def make_ceiling_finder(doc):
     return find
 
 
-def collect_rooms(doc):
-    """Помещения (Rooms) из хоста и связей + пространства (Spaces) хоста, если помещений нет."""
+APT_PARAMS = [u"ADSK_Номер квартиры", u"Номер квартиры", u"Квартира", u"Apartment", u"Unit Number"]
+
+
+def collect_rooms(doc, apt_params=None):
+    """Помещения (Rooms) из хоста и связей + пространства (Spaces) хоста, если помещений нет.
+    apt_params — имена параметров помещения с номером квартиры (первый заполненный идёт в поле apartment)."""
     opts = DB.SpatialElementBoundaryOptions()
     opts.SpatialElementBoundaryLocation = DB.SpatialElementBoundaryLocation.Finish
     finder = make_ceiling_finder(doc)
+    apt_params = apt_params or APT_PARAMS
     rooms = []
     cats = [DB.BuiltInCategory.OST_Rooms]
     for src, sdoc, tr in iter_sources(doc):
         for r in DB.FilteredElementCollector(sdoc).OfCategory(cats[0]).WhereElementIsNotElementType():
-            item = _room_item(r, src, tr, opts, finder)
+            item = _room_item(r, src, tr, opts, finder, apt_params)
             if item:
                 rooms.append(item)
     if not rooms:
         for r in DB.FilteredElementCollector(doc).OfCategory(DB.BuiltInCategory.OST_MEPSpaces).WhereElementIsNotElementType():
-            item = _room_item(r, doc.Title, DB.Transform.Identity, opts, finder)
+            item = _room_item(r, doc.Title, DB.Transform.Identity, opts, finder, apt_params)
             if item:
                 rooms.append(item)
     return rooms
 
 
-def _room_item(r, src, tr, opts, finder):
+def _apartment(r, apt_params):
+    for n in apt_params:
+        p = r.LookupParameter(n)
+        if p is not None and p.HasValue:
+            v = p.AsString() if p.StorageType == DB.StorageType.String else p.AsValueString()
+            if v:
+                return v.strip()
+    return u""
+
+
+def _room_item(r, src, tr, opts, finder, apt_params=None):
     try:
         if r.Area <= 0 or r.Location is None:
             return None
@@ -208,6 +223,7 @@ def _room_item(r, src, tr, opts, finder):
             "id": r.Id.IntegerValue,
             "name": pname(r, DB.BuiltInParameter.ROOM_NAME),
             "number": pname(r, DB.BuiltInParameter.ROOM_NUMBER),
+            "apartment": _apartment(r, apt_params or APT_PARAMS),
             "level": r.Level.Name if r.Level else u"",
             "area_m2": round(_poly_area(polys[0]) / 1e6, 2),
             "floor_z": round(floor_z, 1),

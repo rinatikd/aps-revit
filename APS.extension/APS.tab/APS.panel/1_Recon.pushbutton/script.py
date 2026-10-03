@@ -28,7 +28,7 @@ out.print_md(u"**Источники (хост + загруженные связ�
 
 with forms.ProgressBar(title=u"Помещения и потолки…") as pb:
     pb.update_progress(1, 3)
-    rooms = apslib.collect_rooms(doc)
+    rooms = apslib.collect_rooms(doc, rules.get("zones", {}).get("apartment_params"))
     pb.update_progress(2, 3)
     lines, points = apslib.collect_obstacles(doc)
     pb.update_progress(3, 3)

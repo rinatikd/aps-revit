@@ -31,7 +31,7 @@ levels = apslib.host_levels(doc)
 if not levels:
     forms.alert(u"В хост-модели нет уровней.", exitscript=True)
 
-rooms = apslib.collect_rooms(doc)
+rooms = apslib.collect_rooms(doc, rules.get("zones", {}).get("apartment_params"))
 lines, points = apslib.collect_obstacles(doc)
 if not rooms:
     forms.alert(u"Не найдено ни одного помещения (Rooms/Spaces) ни в хосте, ни в связях.", exitscript=True)
@@ -98,7 +98,10 @@ with revit.Transaction(u"АПС: расстановка извещателей")
             z = ceil_z - pl.get("mount_below_ceiling", 0)
             for (x, y) in res["points"]:
                 inst = apslib.place(doc, symbols[res["role"]], lvl, x, y, z)
-                apslib.set_comments(inst, u"{};role={};room={}".format(marker, res["role"], res["label"]))
+                apslib.set_comments(inst, u"{};role={};room={};rno={};rapt={};rname={};rarea={}".format(
+                    marker, res["role"], res["label"], (r.get("number") or u"").replace(u";", u","),
+                    (r.get("apartment") or u"").replace(u";", u","),
+                    (r.get("name") or u"").replace(u";", u","), r.get("area_m2") or 0))
                 apslib.set_text(inst, rules["params"]["room"], res["label"])
                 total += 1
         if res["problem"]:

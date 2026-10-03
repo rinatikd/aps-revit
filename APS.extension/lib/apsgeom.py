@@ -12,6 +12,7 @@ apsgeom — чистая 2D-геометрия и алгоритм расста�
 """
 from __future__ import division
 import math
+import re
 
 
 # ---------- базовая геометрия ----------
@@ -361,8 +362,9 @@ def build_docs(devs, panel, ven, rules, line_cable=None):
     for d in devs:
         if d.get("loop"):
             loops.setdefault(d["loop"], []).append(d)
+    ring = lp.get("topology") == "ring"
     for lid in sorted(loops, key=_num):
-        items = sorted(loops[lid], key=lambda d: _num(d.get("addr")))
+        items = sorted(loops[lid], key=_loop_order)
         prev, prev_name = panel, pname_
         total = 0.0
         cab = line_cable.get(lid, ven["loop_cable"])
@@ -371,17 +373,26 @@ def build_docs(devs, panel, ven, rules, line_cable=None):
             L = seg_cable_mm(prev, (d["x"], d["y"], d["z"]), lp)
             total += L
             add_cable(cab, L)
-            to = u"{} адр. {}".format(d["model"], d.get("addr", u""))
+            a = d.get("addr", u"")
+            to = u"{} адр. {}".format(d["model"], a) if a not in (None, u"") else d["model"]
             journal.append({"mark": u"{}{}".format(pref, k), "line": lid, "from": prev_name, "to": to,
                             "room": d.get("room", u""), "cable": cab,
                             "length_m": rnd(L / 1000.0, 1)})
             prev, prev_name = (d["x"], d["y"], d["z"]), to
+        if ring and items:
+            k += 1
+            L = seg_cable_mm(prev, panel, lp)
+            total += L
+            add_cable(cab, L)
+            journal.append({"mark": u"{}{}".format(pref, k), "line": lid, "from": prev_name,
+                            "to": u"{} (возврат кольца)".format(pname_), "room": u"", "cable": cab,
+                            "length_m": rnd(L / 1000.0, 1)})
         groups = {}
         for d in items:
             g = groups.setdefault((d["lz"], d["level"]), {})
             g[d["model"]] = g.get(d["model"], 0) + 1
         scheme.append({"line": lid, "kind": "loop", "cable": cab, "length_m": rnd(total / 1000.0, 1),
-                       "count": len(items),
+                       "count": len(items), "ring": ring,
                        "groups": [{"level": lv, "models": groups[(z, lv)]} for (z, lv) in sorted(groups)]})
 
     # неадресные линии: звуковые оповещатели (СОУЭ) и громкоговорители речевого оповещения (РО)
@@ -429,12 +440,13 @@ def build_docs(devs, panel, ven, rules, line_cable=None):
                      "note": u"{} лин. по {} адр.".format(n_loops, ven["max_addresses_per_loop"])})
     titles = {"smoke": u"Извещатель пожарный дымовой адресный", "heat": u"Извещатель пожарный тепловой адресный",
               "mcp": u"Извещатель пожарный ручной адресный", "sounder": u"Оповещатель пожарный",
-              "speaker": u"Оповещатель речевой (громкоговоритель)"}
+              "speaker": u"Оповещатель речевой (громкоговоритель)",
+              "isolator": u"Изолятор короткого замыкания адресной линии"}
     cnt = {}
     for d in devs:
         key = (d["role"], d["model"])
         cnt[key] = cnt.get(key, 0) + 1
-    order_roles = ["smoke", "heat", "mcp", "sounder", "speaker"]
+    order_roles = ["smoke", "heat", "mcp", "isolator", "sounder", "speaker"]
     for (role, model) in sorted(cnt, key=lambda k: (order_roles.index(k[0]) if k[0] in order_roles else 9, k[1])):
         spec.append({"group": u"Оборудование", "name": titles.get(role, u"Устройство АПС"), "mark": model,
                      "maker": ven.get("manufacturer", u""), "unit": u"шт", "qty": cnt[(role, model)], "note": u""})
@@ -484,6 +496,208 @@ def assign_loops(devs, start, cap, loop_name, on_loop_roles):
     return n
 
 
+# ---------- ЗКПС и изоляторы короткого замыкания ----------
+
+def apartment_of(room_no, pattern):
+    """Номер квартиры из номера помещения по шаблону rules.zones.apartment_pattern (группа 1) или None."""
+    if not pattern:
+        return None
+    m = re.match(pattern, u"{}".format(room_no or u""))
+    return m.group(1) if m else None
+
+
+def _centroid(items):
+    n = float(len(items)) or 1.0
+    return (sum(d["x"] for d in items) / n, sum(d["y"] for d in items) / n)
+
+
+def assign_zones(devs, rules, start):
+    """
+    Деление автоматических извещателей на ЗКПС (справочно — СП 484.1311500.2020 п.6.3.3, 6.3.4).
+    devs[i]: role, level, lz, x, y, room (подпись), room_no, room_name, room_area (м²).
+    Квартира (по номеру помещения) и помещения с ключевыми словами (лестницы, шахты) — отдельные ЗКПС;
+    остальные помещения уровня собираются по соседству: не более max_rooms помещений и max_rooms_area_m2.
+    Любая ЗКПС — не более max_detectors извещателей и max_area_m2. Пишет d["zone"], возвращает список зон.
+    """
+    zc = rules.get("zones", {})
+    if not zc.get("enabled"):
+        return []
+    roles = zc.get("roles", ["smoke", "heat"])
+    max_det = int(zc.get("max_detectors", 32))
+    max_area = float(zc.get("max_area_m2", 2000))
+    max_rooms = int(zc.get("max_rooms", 5))
+    max_rooms_area = float(zc.get("max_rooms_area_m2", 500))
+    sep = [k.lower() for k in zc.get("separate_keywords", [])]
+    pat = zc.get("apartment_pattern", u"")
+    by_level = {}
+    for d in devs:
+        if d["role"] in roles:
+            by_level.setdefault((d["lz"], d["level"]), []).append(d)
+    zones = []
+
+    def new_zone(level, lz, kind, title, items, labels, area_m2):
+        n = len(zones) + 1
+        c = _centroid(items)
+        z = {"id": u"{}{}".format(zc.get("prefix", u"ЗКПС "), n), "n": n, "level": level, "lz": lz,
+             "kind": kind, "title": title, "rooms": labels, "area_m2": rnd(area_m2, 1), "count": len(items),
+             "cx": rnd(c[0], 1), "cy": rnd(c[1], 1)}
+        for d in items:
+            d["zone"] = z["id"]
+        zones.append(z)
+
+    for key in sorted(by_level):
+        lz, level = key
+        rooms, order = {}, []
+        for d in by_level[key]:
+            rk = d.get("room") or u""
+            if rk not in rooms:
+                rooms[rk] = {"label": rk, "no": d.get("room_no") or u"", "name": d.get("room_name") or rk,
+                             "apt": d.get("room_apt") or u"", "area": float(d.get("room_area") or 0), "items": []}
+                order.append(rk)
+            rooms[rk]["items"].append(d)
+        apts, apt_order, own, common = {}, [], [], []
+        for rk in order:
+            r = rooms[rk]
+            apt = r["apt"] or apartment_of(r["no"], pat)
+            if apt is not None:
+                if apt not in apts:
+                    apts[apt] = []
+                    apt_order.append(apt)
+                apts[apt].append(r)
+            elif any(k in r["name"].lower() for k in sep):
+                own.append(r)
+            else:
+                common.append(r)
+        groups = []
+        for apt in sorted(apt_order, key=lambda a: (_num(a), a)):
+            groups.append(("apartment", u"Квартира {}".format(apt), apts[apt]))
+        cent = []
+        for i, r in enumerate(common):
+            c = _centroid(r["items"])
+            cent.append((i, c[0], c[1]))
+        pack, pa, pn = [], 0.0, 0
+        for o in order_nearest(cent, start):
+            r = common[o[0]]
+            k = len(r["items"])
+            if pack and (len(pack) + 1 > max_rooms or pa + r["area"] > max_rooms_area or pn + k > max_det):
+                groups.append(("rooms", u"", pack))
+                pack, pa, pn = [], 0.0, 0
+            pack.append(r)
+            pa += r["area"]
+            pn += k
+        if pack:
+            groups.append(("rooms", u"", pack))
+        for r in own:
+            groups.append(("separate", r["label"], [r]))
+        for kind, title, rs in groups:
+            items = [d for r in rs for d in r["items"]]
+            area_m2 = sum(r["area"] for r in rs)
+            labels = [r["label"] for r in rs]
+            title = title or u", ".join(labels)
+            parts = max(1, int(math.ceil(len(items) / float(max_det))),
+                        int(math.ceil(area_m2 / max_area)) if max_area > 0 else 1)
+            if parts == 1:
+                new_zone(level, lz, kind, title, items, labels, area_m2)
+            else:
+                seq = order_nearest([(i, d["x"], d["y"]) for i, d in enumerate(items)], start)
+                size = int(math.ceil(len(seq) / float(parts)))
+                for j, part in enumerate(chunk(seq, size), 1):
+                    new_zone(level, lz, kind, u"{} (часть {})".format(title, j),
+                             [items[p[0]] for p in part], labels, area_m2 / parts)
+    return zones
+
+
+def _isolator(idev, nxt, prev):
+    """Изолятор КЗ между двумя устройствами (середина), перед первым или после последнего (сдвиг 400 мм)."""
+    if nxt is not None and prev is not None:
+        x, y, z, ref = (nxt["x"] + prev["x"]) / 2.0, (nxt["y"] + prev["y"]) / 2.0, (nxt["z"] + prev["z"]) / 2.0, nxt
+    elif nxt is not None:
+        x, y, z, ref = nxt["x"] - 400.0, nxt["y"], nxt["z"], nxt
+    else:
+        x, y, z, ref = prev["x"] + 400.0, prev["y"], prev["z"], prev
+    return {"role": "isolator", "model": idev.get("model", u"Изолятор КЗ"), "level": ref["level"], "lz": ref["lz"],
+            "x": x, "y": y, "z": z, "room": ref.get("room", u""), "zone": u"", "auto": True}
+
+
+def plan_loops(devs, start, cap, loop_name, on_loop_roles, rules, ven):
+    """
+    Шлейфы с учётом ЗКПС и изоляторов КЗ (справочно — СП 484.1311500.2020 п.6.3.4: единичная неисправность
+    не должна выводить одновременно автоматические и ручные ИП и другие ЗКПС).
+    Блок = одна ЗКПС (её извещатели подряд) или один ИПР. Блоки идут «ближайший сосед» от прибора;
+    между соседними блоками — изолятор, в кольце ещё в начале и в конце линии. Блок не делится между линиями.
+    Пишет loop, addr, seq; новые изоляторы добавляются в devs. Возвращает число линий.
+    """
+    iso = rules.get("isolators", {})
+    ring = rules.get("loops", {}).get("topology") == "ring"
+    idev = ven.get("isolator") or {}
+    use_iso = bool(iso.get("enabled")) and bool(idev)
+    ia = (1 if idev.get("takes_address", True) else 0) if use_iso else 0
+    tail = ia if ring else 0
+    by_level = {}
+    for d in devs:
+        if d["role"] in on_loop_roles:
+            by_level.setdefault((d["lz"], d["level"]), []).append(d)
+    added = []
+    n = 0
+    for key in sorted(by_level):
+        blocks, seen = [], {}
+        for d in by_level[key]:
+            z = d.get("zone")
+            if z:
+                if z not in seen:
+                    seen[z] = len(blocks)
+                    blocks.append([])
+                blocks[seen[z]].append(d)
+            else:
+                blocks.append([d])
+        cent = []
+        for i, b in enumerate(blocks):
+            c = _centroid(b)
+            cent.append((i, c[0], c[1]))
+        loops, cur, used, pos = [], [], 0, start
+        for o in order_nearest(cent, start):
+            b = blocks[o[0]]
+            ob = order_nearest([(i, d["x"], d["y"]) for i, d in enumerate(b)], pos)
+            b = [b[p[0]] for p in ob]
+            pos = (b[-1]["x"], b[-1]["y"])
+            if cur and used + len(b) + ia + tail > cap:
+                loops.append(cur)
+                cur, used = [], 0
+            used += len(b) + (ia if (cur or ring) else 0)
+            cur.append(b)
+        if cur:
+            loops.append(cur)
+        for lb in loops:
+            n += 1
+            lid = u"{}{}".format(loop_name, n)
+            seq = []
+            for j, b in enumerate(lb):
+                if use_iso and (j > 0 or ring):
+                    it = _isolator(idev, b[0], seq[-1] if seq else None)
+                    added.append(it)
+                    seq.append(it)
+                seq.extend(b)
+            if use_iso and ring:
+                it = _isolator(idev, None, seq[-1])
+                added.append(it)
+                seq.append(it)
+            a = 0
+            for s, d in enumerate(seq, 1):
+                d["loop"] = lid
+                d["seq"] = s
+                if d["role"] == "isolator" and not ia:
+                    d["addr"] = u""
+                else:
+                    a += 1
+                    d["addr"] = a
+    devs.extend(added)
+    return n
+
+
+def _loop_order(d):
+    return d.get("seq") or _num(d.get("addr"))
+
+
 # ---------- электрический расчёт линий ----------
 
 def line_electrics(seg_m, cur_standby_ma, cur_max_ma, r_ohm_km, u0, u_min, i_max_ma=None, r_max_ohm=None):
@@ -524,17 +738,97 @@ def line_electrics(seg_m, cur_standby_ma, cur_max_ma, r_ohm_km, u0, u_min, i_max
     return res
 
 
+def line_electrics_ring(seg_m, cur_standby_ma, cur_max_ma, r_ohm_km, u0, u_min, i_max_ma=None, r_max_ohm=None):
+    """
+    Кольцевая линия. seg_m — n+1 участков: прибор → устр.1 → … → устр.n → прибор; токи — n устройств.
+    Норма: питание с обоих концов (точный расчёт двустороннего питания).
+    Обрыв: перебор участка обрыва b = 0…n; устройства до обрыва питаются с начала, после — с конца.
+    Проверки идут по худшему обрыву: ΔU, ток линии, R двух жил до самого удалённого устройства.
+    """
+    n = len(cur_max_ma)
+    R = [2.0 * r_ohm_km * s / 1000.0 for s in seg_m]
+    rtot = 0.0
+    for r in R:
+        rtot += r
+    cum, acc = [], 0.0
+    for k in range(n):
+        acc += R[k]
+        cum.append(acc)
+
+    def du_norm(cur):
+        best = 0.0
+        if rtot <= 0:
+            return best
+        for j in range(n):
+            s = 0.0
+            for i in range(n):
+                lo, hi = (cum[i], cum[j]) if cum[i] <= cum[j] else (cum[j], cum[i])
+                s += cur[i] / 1000.0 * lo * (rtot - hi) / rtot
+            if s > best:
+                best = s
+        return best
+
+    def du_break(cur, b):
+        left, t, rl = 0.0, 0.0, 0.0
+        for i in range(b - 1, -1, -1):
+            t += cur[i]
+            left += R[i] * t / 1000.0
+            rl += R[i]
+        right, t, rr = 0.0, 0.0, 0.0
+        for i in range(b, n):
+            t += cur[i]
+            right += R[i + 1] * t / 1000.0
+            rr += R[i + 1]
+        return (left if left > right else right), (rl if rl > rr else rr)
+
+    worst_m, worst_s, worst_b, r_far = 0.0, 0.0, n, 0.0
+    for b in range(n + 1):
+        dm, rf = du_break(cur_max_ma, b)
+        ds = du_break(cur_standby_ma, b)[0]
+        if dm > worst_m + 1e-12:
+            worst_m, worst_b = dm, b
+        if ds > worst_s:
+            worst_s = ds
+        if rf > r_far:
+            r_far = rf
+    i_s = 0.0
+    for c in cur_standby_ma:
+        i_s += c
+    i_m = 0.0
+    for c in cur_max_ma:
+        i_m += c
+    res = {
+        "topology": "ring", "i_standby_ma": rnd(i_s, 2), "i_max_ma": rnd(i_m, 2),
+        "r_loop_ohm": rnd(rtot, 2), "r_far_ohm": rnd(r_far, 2), "du_normal_v": rnd(du_norm(cur_max_ma), 3),
+        "du_standby_v": rnd(worst_s, 3), "du_max_v": rnd(worst_m, 3), "u_end_max_v": rnd(u0 - worst_m, 2),
+        "worst_break": worst_b, "checks": [],
+    }
+    ok = True
+    if u0 - worst_m < u_min:
+        ok = False
+        res["checks"].append(u"обрыв на участке {}: U {:.2f} В < {:.2f} В".format(worst_b + 1, u0 - worst_m, u_min))
+    if i_max_ma and i_m > i_max_ma:
+        ok = False
+        res["checks"].append(u"ток {:.1f} мА > {:.1f} мА".format(i_m, i_max_ma))
+    if r_max_ohm and r_far > r_max_ohm:
+        ok = False
+        res["checks"].append(u"R до дальнего устройства при обрыве {:.1f} Ом > {:.1f} Ом".format(r_far, r_max_ohm))
+    res["ok"] = ok
+    return res
+
+
 def _cands(rules):
     c = rules.get("cable", {})
     ms = c.get("min_section_mm2", 0)
     return [x for x in sorted(c.get("candidates", []), key=lambda x: x["section"]) if x["section"] >= ms]
 
 
-def select_cable(seg_m, cs, cm, rules, u0, u_min, i_max=None, r_max=None):
+def select_cable(seg_m, cs, cm, rules, u0, u_min, i_max=None, r_max=None, ring=False):
     """Минимальное сечение из rules.cable.candidates, при котором линия проходит все проверки."""
     last = None
+    calc = line_electrics_ring if ring else line_electrics
     for c in _cands(rules):
-        e = line_electrics(seg_m, cs, cm, c["r_ohm_km"], u0, u_min, i_max, r_max)
+        e = calc(seg_m, cs, cm, c["r_ohm_km"], u0, u_min, i_max, r_max)
         e["cable"], e["section"] = c["mark"], c["section"]
         last = e
         if e["ok"]:
@@ -552,13 +846,13 @@ def electrics_for_docs(docs, devs, ven, rules):
     for r in docs["scheme"]:
         seg_m = [j["length_m"] for j in docs["journal"] if j["line"] == r["line"]]
         if r["kind"] == "loop":
-            items = sorted([d for d in devs if d.get("loop") == r["line"]], key=lambda d: _num(d.get("addr")))
+            items = sorted([d for d in devs if d.get("loop") == r["line"]], key=_loop_order)
             dc = el.get("device_current_ma", {})
             cs = [dc.get(d["role"], {}).get("standby", 0.0) for d in items]
             cm = [dc.get(d["role"], {}).get("max", 0.0) for d in items]
             u0 = el.get("loop_voltage_v", 0)
             e = select_cable(seg_m, cs, cm, rules, u0, el.get("min_end_voltage_v", 0),
-                             el.get("loop_max_current_ma"), el.get("max_loop_resistance_ohm"))
+                             el.get("loop_max_current_ma"), el.get("max_loop_resistance_ohm"), bool(r.get("ring")))
             e["demo"] = bool(el.get("demo"))
         elif r["kind"] == "voice":
             vc = rules.get("voice", {})
@@ -650,6 +944,131 @@ def full_docs(devs, panel, ven, rules):
     d2["electrics"] = elec
     d2["power"] = pb
     return d2
+
+
+def check_project(docs, devs, zones, rules, ven):
+    """
+    Автопроверка проекта по чек-листу. Пункты — справочно по СП 484.1311500.2020 (с Изм. №1),
+    СП 6.13130.2021, ГОСТ Р 59638-2021 (РФ); для объектов РК сверить с СП РК 2.02-102-2022.
+    Возвращает [{"status": ok|warn|fail|info, "title":, "detail":, "ref":}].
+    """
+    ch = rules.get("checks", {})
+    zc = rules.get("zones", {})
+    out = []
+
+    def add(status, title, detail, ref):
+        out.append({"status": status, "title": title, "detail": detail, "ref": ref})
+
+    # 1. запас ёмкости приборов
+    res = float(ch.get("capacity_reserve", 0.2))
+    maxa = int(ven["max_addresses_per_loop"])
+    used = {}
+    for d in devs:
+        if d.get("loop") and d.get("addr") not in (None, u""):
+            used[d["loop"]] = max(used.get(d["loop"], 0), _num(d["addr"]))
+    bad = [u"{}: {} из {}".format(l, used[l], maxa) for l in sorted(used, key=_num) if used[l] > maxa * (1 - res) + 1e-9]
+    if bad:
+        add("fail", u"Запас ёмкости линий не менее {:.0%}".format(res), u"; ".join(bad), u"СП 484 п.5.20")
+    else:
+        add("ok", u"Запас ёмкости линий не менее {:.0%}".format(res),
+            u"занято не более {} адресов из {} на линию".format(max([0] + list(used.values())), maxa), u"СП 484 п.5.20")
+
+    # 2. ЗКПС
+    if not zc.get("enabled"):
+        add("warn", u"Деление на ЗКПС", u"выключено (rules.zones.enabled = false)", u"СП 484 п.6.3.3, 6.3.4")
+    else:
+        md, ma = int(zc.get("max_detectors", 32)), float(zc.get("max_area_m2", 2000))
+        mr, mra = int(zc.get("max_rooms", 5)), float(zc.get("max_rooms_area_m2", 500))
+        over = []
+        for z in zones:
+            if z["count"] > md:
+                over.append(u"{}: {} ИП > {}".format(z["id"], z["count"], md))
+            if z["area_m2"] > ma + 1e-9:
+                over.append(u"{}: {} м² > {}".format(z["id"], z["area_m2"], ma))
+            if z["kind"] == "rooms" and len(z["rooms"]) > 1 and (len(z["rooms"]) > mr or z["area_m2"] > mra + 1e-9):
+                over.append(u"{}: {} помещ., {} м²".format(z["id"], len(z["rooms"]), z["area_m2"]))
+        if over:
+            add("fail", u"Размер ЗКПС", u"; ".join(over), u"СП 484 п.6.3.4")
+        else:
+            add("ok", u"Размер ЗКПС", u"{} ЗКПС, наибольшая — {} ИП".format(len(zones), max([0] + [z["count"] for z in zones])),
+                u"СП 484 п.6.3.4")
+        n_apt = len([z for z in zones if z["kind"] == "apartment"])
+        kw = [k.lower() for k in ch.get("residential_keywords", [])]
+        living = [d for d in devs if d.get("zone") and any(k in (d.get("room_name") or d.get("room") or u"").lower() for k in kw)]
+        if n_apt:
+            add("ok", u"Квартиры — отдельные ЗКПС", u"квартир: {}".format(n_apt), u"СП 484 п.6.3.3")
+        elif living:
+            add("warn", u"Квартиры — отдельные ЗКПС",
+                u"жилые помещения есть, но квартиры не распознаны по номерам — задайте zones.apartment_pattern",
+                u"СП 484 п.6.3.3")
+
+    # 3. изоляторы КЗ между ЗКПС и между ручными и автоматическими ИП
+    if not (rules.get("isolators", {}).get("enabled") and ven.get("isolator")):
+        add("fail", u"Изоляторы КЗ между ЗКПС и ИПР", u"изоляторы выключены или не заданы у производителя",
+            u"СП 484 п.6.3.4")
+    else:
+        loops = {}
+        for d in devs:
+            if d.get("loop"):
+                loops.setdefault(d["loop"], []).append(d)
+        miss = 0
+        for lid in loops:
+            seq = sorted(loops[lid], key=_loop_order)
+            for a, b in zip(seq, seq[1:]):
+                if a["role"] == "isolator" or b["role"] == "isolator":
+                    continue
+                if a["role"] == "mcp" or b["role"] == "mcp" or (a.get("zone") or u"") != (b.get("zone") or u""):
+                    miss += 1
+        n_iso = len([d for d in devs if d["role"] == "isolator"])
+        if miss:
+            add("fail", u"Изоляторы КЗ между ЗКПС и ИПР", u"границ без изолятора: {}".format(miss), u"СП 484 п.6.3.4")
+        else:
+            add("ok", u"Изоляторы КЗ между ЗКПС и ИПР", u"изоляторов: {} ({})".format(n_iso, ven["isolator"].get("model", u"")),
+                u"СП 484 п.6.3.4")
+
+    # 4. длина линий
+    ml = ven.get("max_loop_length_m")
+    if ml:
+        long_ = [u"{}: {} м".format(r["line"], r["length_m"]) for r in docs["scheme"] if r["kind"] == "loop" and r["length_m"] > ml]
+        add("fail" if long_ else "ok", u"Длина линии не более {} м".format(ml),
+            u"; ".join(long_) if long_ else u"все линии в пределах", ven.get("max_loop_length_ref", u"паспорт прибора"))
+
+    # 5. электрический расчёт
+    badl = [u"{}: {}".format(e["line"], u"; ".join(e["checks"])) for e in docs["electrics"] if not e["ok"]]
+    demo = any(e.get("demo") for e in docs["electrics"])
+    if badl:
+        add("fail", u"Падение напряжения, ток, сопротивление линий", u" | ".join(badl), u"паспорта приборов")
+    else:
+        add("warn" if demo else "ok", u"Падение напряжения, ток, сопротивление линий",
+            u"все линии проходят" + (u" (часть токов — демо-значения)" if demo else u""), u"паспорта приборов")
+
+    # 6. кабель FR
+    ring = rules.get("loops", {}).get("topology") == "ring"
+    iso_on = bool(rules.get("isolators", {}).get("enabled") and ven.get("isolator"))
+    nofr = [r["line"] for r in docs["scheme"] if r["kind"] == "loop" and u"FR" not in (r.get("cable") or u"")]
+    if ring and iso_on:
+        add("info", u"Огнестойкость кабеля АЛС", u"кольцо с изоляторами КЗ — допускается кабель без индекса FR",
+            u"СП 6.13130.2021 п.6.3")
+    elif nofr:
+        add("fail", u"Огнестойкость кабеля АЛС", u"без FR: " + u", ".join(nofr), u"СП 6.13130.2021 п.6.3")
+    else:
+        add("ok", u"Огнестойкость кабеля АЛС", u"кабель с индексом FR", u"СП 6.13130.2021 п.6.3")
+
+    # 7. АКБ с коэффициентом старения
+    kf = float(rules.get("power", {}).get("aging_factor", 1.0))
+    add("ok" if kf >= 1.25 - 1e-9 else "warn", u"Ёмкость АКБ с коэффициентом старения",
+        u"k = {} (ёмкость в конце срока службы не ниже 80 %)".format(kf), u"СП 6.13130.2021; ГОСТ Р 59638-2021 п.6.6.4")
+
+    # 8. автономные извещатели в квартирах
+    if rules.get("placement", {}).get("default_action") == "skip":
+        add("warn", u"Квартиры: автономные дымовые ИП",
+            u"адресные ИП в квартирах не ставятся — нужны автономные дымовые ИП в комнатах, прихожих, коридорах и кухнях",
+            u"СП 484 п.6.2.16; СП 54 п.7.3.5")
+    else:
+        add("info", u"Квартиры: автономные дымовые ИП",
+            u"в квартирах адресные ИП; автономные не обязательны, если по их сигналу включается СОУЭ",
+            u"СП 484 п.6.2.16")
+    return out
 
 
 # ---------- этаж целиком + уточняющий диалог ----------
@@ -919,10 +1338,12 @@ def plan_voice(rooms, lines, points, rules):
 # ---------- DXF для AutoCAD (R12, ASCII, кодировка 1251) ----------
 
 DXF_LAYERS = [(u"АПС_Помещения", 8), (u"АПС_Смежники", 9), (u"АПС_Извещатели", 1), (u"АПС_ИПР", 6),
-              (u"АПС_Оповещатели", 4), (u"АПС_Речевое", 5), (u"АПС_Шлейфы", 3), (u"АПС_Марки", 7), (u"АПС_Прибор", 2)]
+              (u"АПС_Оповещатели", 4), (u"АПС_Речевое", 5), (u"АПС_Шлейфы", 3), (u"АПС_Марки", 7), (u"АПС_Прибор", 2),
+              (u"АПС_ЗКПС", 30), (u"АПС_Изоляторы", 140)]
 DXF_ROLE = {"smoke": ("APS_SMOKE", u"АПС_Извещатели"), "heat": ("APS_HEAT", u"АПС_Извещатели"),
             "mcp": ("APS_MCP", u"АПС_ИПР"), "sounder": ("APS_SOUNDER", u"АПС_Оповещатели"),
-            "speaker": ("APS_SPEAKER", u"АПС_Речевое"), "panel": ("APS_PANEL", u"АПС_Прибор")}
+            "speaker": ("APS_SPEAKER", u"АПС_Речевое"), "panel": ("APS_PANEL", u"АПС_Прибор"),
+            "isolator": ("APS_ISO", u"АПС_Изоляторы")}
 
 
 def _f(v):
@@ -984,6 +1405,8 @@ class Dxf(object):
         blk("APS_SPEAKER", [c(250), l(-150, -150, 150, 150), l(-150, 150, 150, -150)])
         blk("APS_PANEL", [l(-400, -250, 400, -250), l(400, -250, 400, 250), l(400, 250, -400, 250),
                           l(-400, 250, -400, -250), t(u"П", 250)])
+        blk("APS_ISO", [l(-150, -100, 150, -100), l(150, -100, 150, 100), l(150, 100, -150, 100),
+                        l(-150, 100, -150, -100), t(u"И", 150)])
         return out
 
     def text_out(self):
@@ -1000,8 +1423,8 @@ class Dxf(object):
         return u"\n".join(hdr + tab + blocks + ents) + u"\n"
 
 
-def dxf_plan(rooms, lines, points, devs, panel):
-    """План уровня для AutoCAD: помещения, смежники, устройства (блоки), шлейфы, марки адресов. Единицы — мм."""
+def dxf_plan(rooms, lines, points, devs, panel, zones=None, ring=False):
+    """План уровня для AutoCAD: помещения, смежники, устройства (блоки), шлейфы, марки адресов, ЗКПС. Единицы — мм."""
     d = Dxf()
     for r in rooms:
         d.poly(r["poly"], u"АПС_Помещения", True)
@@ -1024,23 +1447,34 @@ def dxf_plan(rooms, lines, points, devs, panel):
     for dv in devs:
         blk, layer = DXF_ROLE.get(dv["role"], ("APS_SMOKE", u"АПС_Извещатели"))
         d.insert(blk, dv["x"], dv["y"], layer)
-        mark = u"{}.{}".format(dv["loop"], dv["addr"]) if dv.get("loop") else (dv.get("line") or u"")
+        if dv.get("loop"):
+            a = dv.get("addr")
+            mark = dv["loop"] if a in (None, u"") else u"{}.{}".format(dv["loop"], a)
+        else:
+            mark = dv.get("line") or u""
         if dv.get("power_w"):
             mark += u" {}Вт".format(_f(dv["power_w"]))
         if mark:
             d.text(dv["x"] + 300, dv["y"] + 300, 200, mark, u"АПС_Марки")
     if panel:
         d.insert("APS_PANEL", panel[0], panel[1], u"АПС_Прибор")
+    here = set(dv.get("zone") for dv in devs if dv.get("zone"))
+    for z in zones or []:
+        if z["id"] in here:
+            d.text(z["cx"] - 600, z["cy"] - 700, 300, z["id"], u"АПС_ЗКПС")
     loops = {}
     for dv in devs:
         if dv.get("loop"):
             loops.setdefault(dv["loop"], []).append(dv)
     start = (panel[0], panel[1]) if panel else None
     for lid in sorted(loops, key=_num):
-        items = sorted(loops[lid], key=lambda q: _num(q.get("addr")))
+        items = sorted(loops[lid], key=_loop_order)
         prev = start or (items[0]["x"], items[0]["y"])
         for it in items:
             d.line(prev[0], prev[1], it["x"], prev[1], u"АПС_Шлейфы")
             d.line(it["x"], prev[1], it["x"], it["y"], u"АПС_Шлейфы")
             prev = (it["x"], it["y"])
+        if ring and start:
+            d.line(prev[0], prev[1], start[0], prev[1], u"АПС_Шлейфы")
+            d.line(start[0], prev[1], start[0], start[1], u"АПС_Шлейфы")
     return d.text_out()
