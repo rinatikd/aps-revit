@@ -9,3 +9,6 @@ APS.extension.zip
 *.dxf
 *.csv
 out.json
+Revit-проекты/
+lv-revit/
+vols-acad/
