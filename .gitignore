@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# Результаты работы кнопок и HTML (генерируются заново)
+aps_recon.json
+*.aps.json
+APS.extension.zip
+*.dxf
+*.csv
