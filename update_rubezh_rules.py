@@ -7,30 +7,54 @@ script_dir = Path(__file__).parent.resolve()
 file_path = script_dir / "APS.extension" / "lib" / "aps_rules.json"
 backup_path = file_path.with_suffix(".json.bak")
 
-# Новые паспортные данные Рубеж R3, строго соответствующие схеме apsgeom.py и parity.js
+# Новые паспортные данные Рубеж R3, строго соответствующие схеме всех модулей проекта
 rubezh_update = {
     "name": "Рубеж R3",
     "manufacturer": "НВП Болид / Рубеж",
-    "max_addresses_per_loop": 127,  # Требуется parity.js для расчета cap
+    "max_addresses_per_loop": 127,  # Требуется parity.js и 4_Loops для расчета cap
     "loop_fill_ratio": 0.8,
     "loops_per_panel": 2,
     "max_loop_length_m": 3000,
     
-    # Должны быть словарями с ключом "model" (требование apsgeom.py и parity.js)
+    # Должны содержать "family" и "model" (требование 4_Loops.pushbutton и apslib.find_symbol)
     "panel": {
+        "family": "R3-Рубеж-2ОП",
+        "type": "",
         "model": "R3-Рубеж-2ОП",
         "_note": "РЭ ППКОПУ «Рубеж-2ОП прот.R3» (ПАСН.425513.003 РЭ ред. 18)"
     },
     "isolator": {
+        "family": "ИЗ-1Б-R3",
+        "type": "",
         "model": "ИЗ-1Б-R3",
         "takes_address": True,
         "_note": "РЭ ИП 212-64-R3, п. 2.7"
     },
     "devices": {
-        "smoke": {"model": "ИП 212-64-R3"},
-        "heat": {"model": "ИП 101-29-PR-R3"},
-        "mcp": {"model": "ИПР 513-11-А-R3"},
-        "sounder": {"model": "ОПОП 124-R3"}
+        "smoke": {
+            "family": "ИП 212-64-R3",
+            "type": "",
+            "model": "ИП 212-64-R3",
+            "on_loop": True
+        },
+        "heat": {
+            "family": "ИП 101-29-PR-R3",
+            "type": "",
+            "model": "ИП 101-29-PR-R3",
+            "on_loop": True
+        },
+        "mcp": {
+            "family": "ИПР 513-11-А-R3",
+            "type": "",
+            "model": "ИПР 513-11-А-R3",
+            "on_loop": True
+        },
+        "sounder": {
+            "family": "ОПОП 124-R3",
+            "type": "",
+            "model": "ОПОП 124-R3",
+            "on_loop": False  # Оповещатели идут по отдельной линии СОУЭ, а не в адресном шлейфе
+        }
     },
     
     "electrical": {
@@ -40,7 +64,6 @@ rubezh_update = {
         "loop_max_current_ma": 220,
         "max_loop_resistance_ohm": 300,
         
-        # Должен быть словарем (требование apsgeom.py line ~415)
         "panel_current_ma": {
             "standby": 400,
             "max": 400,
@@ -100,8 +123,8 @@ if file_path.exists():
             json.dump(data, f, indent=2, ensure_ascii=False)
             
         print("✅ Успешно! Файл aps_rules.json обновлен паспортными данными Рубеж R3.")
-        print("💡 Структура теперь на 100% совместима с apsgeom.py и parity.js.")
-        print("💡 Следующий шаг: запустите python tools/sync_html.py для встраивания в HTML.")
+        print("💡 Структура теперь на 100% совместима с apslib.py, apsgeom.py и скриптами кнопок.")
+        print("💡 Следующий шаг: запустите 'python tools/sync_html.py' для встраивания в HTML.")
     except Exception as e:
         print(f"❌ Ошибка при обновлении файла: {e}")
 else:
