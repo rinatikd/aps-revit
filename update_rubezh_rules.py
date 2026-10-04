@@ -7,7 +7,8 @@ file_path = "APS.extension/lib/aps_rules.json"
 # Новые паспортные данные Рубеж R3
 rubezh_update = {
     "name": "Рубеж R3",
-    "families": {
+    # ИСПРАВЛЕНО: 'devices' вместо 'families', чтобы соответствовать v.devices[r.role].model в parity.js
+    "devices": {
         "smoke": "ИП 212-64-R3",
         "heat": "ИП 101-29-PR-R3",
         "mcp": "ИПР 513-11-А-R3",
@@ -34,6 +35,8 @@ rubezh_update = {
             "_status_heat": "РЭ ИП 101-29-PR-R3, п. 2.7: Ток в дежурном режиме",
             "mcp": 0.46,
             "_status_mcp": "РЭ ИПР 513-11-А-R3, п. 2.3: Ток в дежурном режиме",
+            "sounder": 0.2,
+            "_status_sounder": "РЭ ОПОП 124-R3, п. 2.1: Ток потребления в дежурном режиме (до 2.2 мА в тревоге)",
             "isolator_standby": 0.7,
             "_status_isolator_standby": "РЭ ИП 212-64-R3, п. 2.7: Ток изолятора в дежурном режиме",
             "isolator_active": 10.0,
@@ -43,7 +46,10 @@ rubezh_update = {
     "max_loop_length_m": 3000,
     "_status_max_loop_length": "РЭ ППКОПУ «Рубеж-2ОП прот.R3», п. 1.3.14",
     "loops_per_panel": 2,
-    "loop_fill_ratio": 0.8
+    "loop_fill_ratio": 0.8,
+    # ИСПРАВЛЕНО: добавлено поле, которое явно используется в parity.js для расчета cap
+    "max_addresses_per_loop": 127 
+}
 }
 
 if os.path.exists(file_path):
